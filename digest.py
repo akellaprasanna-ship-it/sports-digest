@@ -7,6 +7,7 @@ asks Claude to synthesize a brief, and sends it to Telegram.
 import os
 import sys
 import json
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -62,10 +63,10 @@ TARGET_WORD_COUNT = 450             # Raised from 300 to fit 8 possible leagues
 DRY_RUN = False                      # If True, print to stdout instead of sending to Telegram
 
 # RSS feeds for news context
-# For European football leagues, Guardian is used in addition to/instead of BBC because
-# BBC's feed is heavily EPL-skewed. Guardian covers Premier League, European and World
-# football more evenly. For F1, Autosport is far richer on off-track news (regulations,
-# contracts, testing) than ESPN's race-centric feed.
+# For European football leagues, Guardian is used instead of BBC because BBC's feed
+# is heavily EPL-skewed. Guardian covers Premier League, European and World football
+# more evenly. For F1, Motorsport.com provides high-quality coverage of both on-track
+# and off-track action (regulations, contracts, team news, testing).
 RSS_FEEDS = {
     "ipl": "https://www.espncricinfo.com/rss/content/story/feeds/6.xml",
     "nba": "https://www.espn.com/espn/rss/nba/news",
@@ -74,7 +75,7 @@ RSS_FEEDS = {
     "laliga": "https://www.theguardian.com/football/rss",
     "bundesliga": "https://www.theguardian.com/football/rss",
     "seriea": "https://www.theguardian.com/football/rss",
-    "f1": "https://www.autosport.com/rss/feed/f1/news/",
+    "f1": "https://www.motorsport.com/rss/f1/news/",
 }
 
 # How many headlines to pass to Claude per league (keeps prompt tight)
@@ -153,13 +154,49 @@ request_counts = {"cricketdata": 0, "api_sports": 0, "rss": 0}
 # Design: one league failing should never kill the digest.
 # ---------------------------------------------------------------------------
 
+# Retry tuning for _safe_get. One retry after RETRY_DELAY seconds, but only for
+# transient errors (timeouts, connection resets, 5xx). 4xx errors (bad key, quota,
+# bad params) aren't retried because they won't fix themselves in 2 seconds.
+RETRY_DELAY_SECONDS = 2
+
+
+def _is_transient_error(exc):
+    """Classify an exception as transient (retry) or permanent (give up)."""
+    # Timeouts and connection errors are always transient
+    if isinstance(exc, (requests.Timeout, requests.ConnectionError)):
+        return True
+    # HTTP errors: retry only 5xx (server-side). 4xx are client errors we shouldn't retry.
+    if isinstance(exc, requests.HTTPError):
+        status = exc.response.status_code if exc.response is not None else 0
+        return 500 <= status < 600
+    return False
+
+
 def _safe_get(url, headers=None, params=None, timeout=15, counter_key=None):
-    """Wrapper that returns parsed JSON or raises; caller handles errors."""
+    """Wrapper that returns parsed JSON or raises; caller handles errors.
+    Retries once after RETRY_DELAY_SECONDS on transient errors only."""
     if counter_key:
         request_counts[counter_key] = request_counts.get(counter_key, 0) + 1
-    r = requests.get(url, headers=headers or {}, params=params or {}, timeout=timeout)
-    r.raise_for_status()
-    return r.json()
+
+    try:
+        r = requests.get(url, headers=headers or {}, params=params or {}, timeout=timeout)
+        r.raise_for_status()
+        return r.json()
+    except Exception as first_exc:
+        if not _is_transient_error(first_exc):
+            raise  # permanent error, don't retry
+
+        # Transient — wait, retry once, and let the second attempt's result stand
+        short_url = url.split("?")[0][-60:]
+        print(f"  [retry] {short_url} failed ({type(first_exc).__name__}), retrying in "
+              f"{RETRY_DELAY_SECONDS}s...")
+        time.sleep(RETRY_DELAY_SECONDS)
+
+        if counter_key:
+            request_counts[counter_key] = request_counts.get(counter_key, 0) + 1
+        r = requests.get(url, headers=headers or {}, params=params or {}, timeout=timeout)
+        r.raise_for_status()
+        return r.json()
 
 
 def fetch_ipl():
@@ -284,17 +321,21 @@ def fetch_football(league_id, label, season=2025):
 
 
 def fetch_f1():
-    """API-Sports F1 — returns data only when a race session is within the weekend window.
-    Off-weekend days return {"skip": True, "reason": "..."} to signal the orchestrator
-    to omit the F1 section entirely.
+    """API-Sports F1 — returns one of two modes depending on calendar:
 
-    Costs 1 request on non-race days (just the season schedule check) and 2 on race days
-    (schedule + recent races)."""
+      mode='race_weekend': a race session falls within the weekend window
+        (F1_WINDOW_DAYS_BEHIND..F1_WINDOW_DAYS_AHEAD). Returns the race + top-10
+        results (if completed). Claude covers on-track action: practice, quali, race.
+
+      mode='inter_race': no race in window. Returns just the upcoming race name/date
+        as a light anchor. Claude leans on NEWS for off-track storylines: regulation
+        talks, contracts, driver moves, team news, testing.
+
+    Costs 1 request on inter-race days, 2 on race weekends (schedule + rankings)."""
     try:
         headers = {"x-apisports-key": API_SPORTS_KEY}
         season = datetime.now(timezone.utc).year
 
-        # Get the full season schedule first. This endpoint returns all races with dates.
         races_resp = _safe_get(
             "https://v1.formula-1.api-sports.io/races",
             headers=headers,
@@ -304,9 +345,10 @@ def fetch_f1():
         races = races_resp.get("response", [])
 
         if not races:
-            return {"skip": True, "reason": "no races in season schedule"}
+            return {"mode": "inter_race", "next_race": None,
+                    "note": "no races in season schedule"}
 
-        # Find the closest race to today
+        # Find the closest race(s) to today
         today_utc = datetime.now(timezone.utc).date()
         ahead_cutoff = today_utc + timedelta(days=F1_WINDOW_DAYS_AHEAD)
         behind_cutoff = today_utc - timedelta(days=F1_WINDOW_DAYS_BEHIND)
@@ -331,11 +373,19 @@ def fetch_f1():
             if race_date <= today_utc and (last_race is None or race_date > last_race["_date"]):
                 last_race = {**race, "_date": race_date}
 
-        if not in_window:
-            next_info = f"next race on {next_race['_date'].isoformat()}" if next_race else "no upcoming race"
-            return {"skip": True, "reason": f"no F1 session in window; {next_info}"}
+        def _strip_internal(r):
+            """Remove internal _date helper key before passing to Claude."""
+            return {k: v for k, v in (r or {}).items() if k != "_date"} if r else None
 
-        # We're in a race weekend window — fetch last race results for context
+        # Inter-race mode — news drives the section
+        if not in_window:
+            return {
+                "mode": "inter_race",
+                "next_race": _strip_internal(next_race),
+                "last_race": _strip_internal(last_race),
+            }
+
+        # Race weekend mode — fetch last completed race results for context
         race_in_window = in_window[0]
         race_id = race_in_window.get("id")
         ranking = None
@@ -347,14 +397,15 @@ def fetch_f1():
                     params={"race": race_id},
                     counter_key="api_sports",
                 )
-                ranking = ranking_resp.get("response", [])[:10]  # top 10 finishers
+                ranking = ranking_resp.get("response", [])[:10]
             except Exception as e:
                 ranking = {"error": f"ranking fetch failed: {e}"}
 
         return {
+            "mode": "race_weekend",
             "in_window_race": race_in_window,
             "results_top10": ranking,
-            "next_race": {k: v for k, v in (next_race or {}).items() if k != "_date"},
+            "next_race": _strip_internal(next_race),
         }
     except Exception as e:
         return {"error": f"F1 fetch failed: {e}"}
@@ -443,17 +494,17 @@ def gather_all():
             "topics": LEAGUES[key]["topics"],
         }
 
-    # F1 is conditional — only include on race weekends
+    # F1 — always included. Two modes: race-weekend (on-track action) or
+    # inter-race (off-track news like contracts, regulations, team moves).
     if LEAGUES.get("f1", {}).get("enabled"):
         f1_data = fetch_f1()
-        if f1_data.get("skip"):
-            print(f"  [f1] skipping section: {f1_data.get('reason', 'off-weekend')}")
-        else:
-            results["f1"] = {
-                "data": f1_data,
-                "news": fetch_rss(RSS_FEEDS["f1"], "f1"),
-                "topics": LEAGUES["f1"]["topics"],
-            }
+        mode = f1_data.get("mode", "unknown")
+        print(f"  [f1] mode: {mode}")
+        results["f1"] = {
+            "data": f1_data,
+            "news": fetch_rss(RSS_FEEDS["f1"], "f1"),
+            "topics": LEAGUES["f1"]["topics"],
+        }
 
     return results
 
@@ -513,6 +564,63 @@ Treat them differently:
 7. STAY IN YOUR LEAGUE. Each league's NEWS items are provided under that league's key.
    News filed under EPL is for the EPL section. Do not move news between leagues.
    Do not include items about other sports or leagues that aren't among the four covered.
+
+8. F1 HAS TWO MODES — check the "mode" field in F1 DATA:
+   - If mode is "race_weekend": lead with on-track action (practice, qualifying, race
+     results). Use results_top10 if present. News is secondary color.
+   - If mode is "inter_race": lead with off-track news (regulation changes, driver
+     contracts, team moves, testing stories) from the NEWS section. Use only a short
+     anchor line from DATA — e.g., "Next race: [name], [date]" — and focus on what's
+     happening between rounds. Do NOT recycle old race results in inter-race mode.
+   If NEWS is empty during inter-race mode and there's nothing meaningful to report,
+   omit the F1 section entirely (per rule for empty sections below).
+
+===========================================================================
+IMPORTANCE TIERS — what MUST vs what MAY be covered
+===========================================================================
+
+Before writing any section, scan the DATA and NEWS for that league and classify
+what you found against these tiers. Tier 1 items are non-negotiable. Tier 2 items
+fill remaining space. Tier 3 items are color only.
+
+TIER 1 — MUST COVER if present in DATA or NEWS for that league:
+  - Major awards (MVP, Sixth Man, Coach of the Year, Player of the Month,
+    Clutch Player, Golden Boot, Ballon d'Or, etc.)
+  - Season-ending or multi-week injuries to star or marquee players
+  - Coaching or managerial changes (hiring, firing, resignation, mutual parting)
+  - Rule, regulation, or format changes affecting the sport
+  - Trades, signings, or contract extensions involving star players
+  - Playoff series eliminations (a team knocked out) or series clinches
+  - Suspensions or bans of players or staff
+  - Records broken (career, season, single-game)
+  - Title wins, promotions, relegations (confirmed, not speculation)
+
+TIER 2 — COVER if the section has room after Tier 1:
+  - Individual game / match results
+  - Standings changes within the top positions
+  - Minor or day-to-day injuries
+  - Named transfer rumors (player mentioned by name and reported source)
+  - Notable statistical milestones below record-breaking
+  - Tactical or team-form storylines
+
+TIER 3 — USE AS COLOR ONLY, never lead with these:
+  - Post-game quotes and reactions
+  - Officiating complaints and referee criticism
+  - Fan or pundit commentary
+  - Pure speculation (no named source, no named player)
+  - Generic "pressure mounting" / "crossroads" / "must win" framing
+
+HOW TO APPLY:
+  - If a Tier 1 item is present in the input for a league, it MUST appear in that
+    league's section. Never omit a Tier 1 item to hit the word-count target —
+    exceed the target if needed. Target word count is a guideline, Tier 1 is a rule.
+  - If a Tier 1 item conflicts with the "omit empty section" rule, Tier 1 wins —
+    i.e., if NEWS has a Tier 1 award announcement for a league with no matches,
+    the section must still be written, even if short.
+  - Within a section, lead with the most important Tier 1 item, then other Tier 1
+    items, then Tier 2, then (sparingly) Tier 3 as color.
+  - Do not invent tier assignments for items not present in input. Classification
+    applies only to what's actually in DATA or NEWS.
 
 ===========================================================================
 FORMAT
