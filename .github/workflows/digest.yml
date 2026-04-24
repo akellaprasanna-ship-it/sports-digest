@@ -1,0 +1,39 @@
+name: Daily Sports Digest
+
+on:
+  # Scheduled run: 04:15 UTC daily = 9:45 AM IST.
+  # 15 min before our 10 AM IST target to absorb GitHub Actions cron drift,
+  # which can be 5-30+ minutes during high-load periods.
+  schedule:
+    - cron: "15 4 * * *"
+
+  # Manual trigger: lets you run the workflow on demand from the GitHub UI.
+  # Useful for testing before the scheduled run, or for re-runs after a failure.
+  workflow_dispatch:
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run digest
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CRICKET_DATA_API_KEY: ${{ secrets.CRICKET_DATA_API_KEY }}
+          API_SPORTS_KEY: ${{ secrets.API_SPORTS_KEY }}
+        run: python digest.py
