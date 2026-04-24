@@ -698,22 +698,18 @@ def generate_brief(results):
 # ---------------------------------------------------------------------------
 
 def escape_markdown_v2(text):
-    """Telegram MarkdownV2 requires escaping these characters outside formatting entities.
-    We take a conservative approach: escape only the characters that commonly break messages,
-    assuming Claude produced well-formed *bold* markers."""
-    # These need escaping when not part of markdown syntax
-    escape_chars = r"_[]()~`>#+-=|{}.!"
-    out = []
-    in_bold = False
-    for ch in text:
-        if ch == "*":
-            in_bold = not in_bold
-            out.append(ch)
-        elif ch in escape_chars and not in_bold:
-            out.append("\\" + ch)
-        else:
-            out.append(ch)
-    return "".join(out)
+    """Escape special characters for Telegram MarkdownV2.
+
+    Per Telegram's MarkdownV2 spec, these characters MUST be escaped with a backslash
+    anywhere in the message EXCEPT when they are part of a formatting entity:
+        _ * [ ] ( ) ~ ` > # + - = | { } . !
+
+    We keep `*` unescaped so Claude's *bold* markers still work as formatting.
+    All other special characters get escaped unconditionally — even inside a bold
+    region, which Telegram's parser also requires."""
+    # All MarkdownV2 special chars EXCEPT `*` (which we preserve as bold markers)
+    special = set("_[]()~`>#+-=|{}.!\\")
+    return "".join("\\" + ch if ch in special else ch for ch in text)
 
 
 def send_to_telegram(text):
