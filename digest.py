@@ -265,10 +265,16 @@ def fetch_ipl():
 
 
 def fetch_nba():
-    """API-Sports NBA — yesterday's games + standings."""
+    """API-Sports NBA — yesterday's completed games only.
+
+    NOTE: We deliberately do NOT fetch today's scheduled games during the playoffs.
+    API-Sports returns the original bracket schedule unchanged after series end,
+    so a Game 5 between teams who already settled in 4 games still appears as
+    'Scheduled'. There's no status field that distinguishes real upcoming games
+    from these placeholder slots, so safer to skip the preview entirely than to
+    risk reporting a game that won't happen. See conversation 2026-04-30 for context."""
     try:
         yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         headers = {"x-apisports-key": API_SPORTS_KEY}
 
         yest_games = _safe_get(
@@ -277,15 +283,9 @@ def fetch_nba():
             params={"date": yesterday},
             counter_key="api_sports",
         )
-        today_games = _safe_get(
-            "https://v2.nba.api-sports.io/games",
-            headers=headers,
-            params={"date": today},
-            counter_key="api_sports",
-        )
         return {
             "yesterday": yest_games.get("response", [])[:12],
-            "today": today_games.get("response", [])[:12],
+            "today": [],  # Intentionally empty — see docstring
         }
     except Exception as e:
         return {"error": f"NBA fetch failed: {e}"}
